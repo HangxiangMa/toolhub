@@ -146,6 +146,10 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
     current_frame: Dict[Tuple[int, str], int] = {}
     # Track current req_id per (ctx, link)
     current_req: Dict[Tuple[int, str], int] = {}
+    # Track the last emitted RUP event per (ctx, link) so update_sof_ts can
+    # retroactively fix its frame/req (the RUP log line prints BEFORE
+    # update_sof_ts in the same ISR, so it picks up stale values at parse time).
+    last_rup_event: Dict[Tuple[int, str], Event] = {}
     # Track link per ctx from earlier context logs
     ctx_link_map: Dict[int, str] = {}
     # Reverse: link -> ctx (populated from trustworthy sources only)
@@ -405,6 +409,8 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
                 )
                 if _filter_event(evt, ctx_filter, link_filter):
                     events.append(evt)
+                if evt_type == 'RUP':
+                    last_rup_event[(ctx_id, link)] = evt
                 continue
 
             # 3. SOF timestamp update (frame_id and req_id tracking)
@@ -420,6 +426,14 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
                 if link != '0xffffffff':
                     link_to_ctx[link] = ctx_id
                     req_link_to_ctx[(req_id, link)] = ctx_id
+                # Retroactively fix the most recent RUP's frame/req: the RUP
+                # log line prints before update_sof_ts in the same ISR, so it
+                # captured stale values. Only fix if the RUP was within 5ms
+                # (same bottom-half batch).
+                prev_rup = last_rup_event.get((ctx_id, link))
+                if prev_rup and abs(ts_ms - prev_rup.ts_ms) < 5.0:
+                    prev_rup.frame_id = frame_id
+                    prev_rup.req_id = req_id
                 continue
 
             # 4. Handle CSID event (REG_UPDATE/EPOCH) - skip, use irq_handler
