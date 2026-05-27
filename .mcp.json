@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "toolhub": {
+      "command": "python3",
+      "args": ["server.py"],
+      "cwd": "/local/mnt/workspace2/hangxian/work/toolhub"
+    }
+  }
+}
