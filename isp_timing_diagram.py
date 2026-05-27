@@ -165,14 +165,31 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
     last_hw_ts_per_path: Dict[Tuple[int, str], float] = {}
     # Track which CSIDs have parse_path_irq_status logs (preferred over path_top_half).
     # Pre-scan the file to detect this before main parsing loop.
+    # Also detect log format (ftrace vs logcat) and compute HW→line timestamp offset.
     csid_has_hw_ts: set = set()
+    is_ftrace = False
+    hw_to_line_offset: float = 0.0
+    offset_samples: List[float] = []
     with open(filepath, 'r', errors='replace') as f_pre:
         for pre_line in f_pre:
+            if not is_ftrace and ts_re_ftrace.search(pre_line):
+                is_ftrace = True
             if 'parse_path_irq_status' in pre_line:
                 m_pre = csid_irq_status_re.search(pre_line)
                 if m_pre:
                     csid_has_hw_ts.add(int(m_pre.group(1)))
-    # Now csid_has_hw_ts is fully populated before main loop
+                    # Collect offset samples (line_ts - hw_ts)
+                    if len(offset_samples) < 50:
+                        pre_ts_str, pre_ts_ms = _line_ts(pre_line)
+                        if pre_ts_ms is not None:
+                            pre_hw_sec = int(m_pre.group(4))
+                            pre_hw_nsec = int(m_pre.group(5))
+                            pre_hw_ms = pre_hw_sec * 1000.0 + pre_hw_nsec / 1_000_000.0
+                            offset_samples.append(pre_ts_ms - pre_hw_ms)
+    # The HW event happens BEFORE the log line is printed (ISR + printk latency).
+    # So (line_ts - hw_ts) >= true_offset. Use the minimum sample as best estimate.
+    if offset_samples:
+        hw_to_line_offset = min(offset_samples)
 
     # Pattern to learn ctx-link mapping
     ctx_link_re = re.compile(r'ctx[_:]?\s*(\d+).*?link[:\s]+\s*(0x[0-9a-fA-F]+)')
@@ -217,7 +234,14 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
                 evt_type = m.group(3)  # "SOF" or "EOF"
                 hw_sec = int(m.group(4))
                 hw_nsec = int(m.group(5))
-                hw_ts_ms = hw_sec * 1000.0 + hw_nsec / 1_000_000.0
+                # Raw HW timestamp in boot-time ms
+                hw_ts_raw = hw_sec * 1000.0 + hw_nsec / 1_000_000.0
+                # Convert to the line-timestamp domain (identity for ftrace,
+                # adds wall-clock offset for logcat).
+                # The HW event happened BEFORE the log line was printed (ISR
+                # latency), so hw_ts_ms <= ts_ms. This preserves the true
+                # timing relationship between SOF/EOF and other events.
+                hw_ts_ms = hw_ts_raw + hw_to_line_offset
 
                 # Normalize path name
                 if path_raw == 'IPP':
@@ -2370,7 +2394,7 @@ def main():
                                               max_width=args.width)
 
     if args.output:
-        with open(args.output, 'w') as f:
+        with open(args.output, 'w', encoding='utf-8') as f:
             f.write(output)
         print(f"Output written to: {args.output}")
     else:
