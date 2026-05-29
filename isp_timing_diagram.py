@@ -27,7 +27,8 @@ EVENT_SYMBOLS = {
     'SOF':      '▼',   # frame start
     'EOF':      '▲',   # frame end
     'RUP':      '■',   # register update
-    'EPOCH':    '●',   # epoch
+    'EPOCH0':   '●',   # epoch0
+    'EPOCH1':   '○',   # epoch1
     'BUF_DONE': '★',   # buffer done
 }
 
@@ -35,7 +36,8 @@ EVENT_COLORS = {
     'SOF':      '\033[92m',  # green
     'EOF':      '\033[91m',  # red
     'RUP':      '\033[94m',  # blue
-    'EPOCH':    '\033[93m',  # yellow
+    'EPOCH0':   '\033[93m',  # yellow
+    'EPOCH1':   '\033[33m',  # dark yellow
     'BUF_DONE': '\033[95m',  # magenta
 }
 RESET_COLOR = '\033[0m'
@@ -96,8 +98,10 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
     # Log format:
     #   "cam_ife_csid_ver2_parse_path_irq_status: 3118: CSID[1] IRQ IPP1 INFO_INPUT_SOF timestamp: [602:967443206]"
     #   "cam_ife_csid_ver2_parse_path_irq_status: 3118: CSID[1] IRQ IPP1 INFO_INPUT_EOF timestamp: [602:977396487]"
+    #   "cam_ife_csid_ver2_parse_path_irq_status: 3118: CSID[1] IRQ IPP CAMIF_EPOCH0 timestamp: [602:970000000]"
+    #   "cam_ife_csid_ver2_parse_path_irq_status: 3118: CSID[1] IRQ IPP CAMIF_EPOCH1 timestamp: [602:975000000]"
     csid_irq_status_re = re.compile(
-        r'cam_ife_csid_ver2_parse_path_irq_status.*?CSID\[(\d+)\]\s+IRQ\s+(\w+)\s+INFO_INPUT_(SOF|EOF)\s+timestamp:\s*\[(\d+):(\d+)\]')
+        r'cam_ife_csid_ver2_parse_path_irq_status.*?CSID\[(\d+)\]\s+IRQ\s+(\w+)\s+(?:INFO_INPUT_(SOF|EOF)|CAMIF_(EPOCH0|EPOCH1))\s+timestamp:\s*\[(\d+):(\d+)\]')
 
     # Pattern: CSID path top half status (SOF/EOF from CSID IRQ) - legacy fallback
     # Log format examples:
@@ -186,8 +190,8 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
                     if len(offset_samples) < 50:
                         pre_ts_str, pre_ts_ms = _line_ts(pre_line)
                         if pre_ts_ms is not None:
-                            pre_hw_sec = int(m_pre.group(4))
-                            pre_hw_nsec = int(m_pre.group(5))
+                            pre_hw_sec = int(m_pre.group(5))
+                            pre_hw_nsec = int(m_pre.group(6))
                             pre_hw_ms = pre_hw_sec * 1000.0 + pre_hw_nsec / 1_000_000.0
                             offset_samples.append(pre_ts_ms - pre_hw_ms)
     # The HW event happens BEFORE the log line is printed (ISR + printk latency).
@@ -230,14 +234,14 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
                     ctx_ipp_paths[ctx_id].add(res_name)
                 continue
 
-            # 0. CSID IRQ status with HW timestamp (preferred source for SOF/EOF)
+            # 0. CSID IRQ status with HW timestamp (preferred source for SOF/EOF/EPOCH)
             m = csid_irq_status_re.search(line)
             if m:
                 csid_idx = int(m.group(1))
-                path_raw = m.group(2)  # "IPP", "IPP1", "RDI0", etc.
-                evt_type = m.group(3)  # "SOF" or "EOF"
-                hw_sec = int(m.group(4))
-                hw_nsec = int(m.group(5))
+                path_raw = m.group(2)  # "IPP", "IPP1", "IPP2", "RDI0", etc.
+                evt_type = m.group(3) or m.group(4)  # "SOF"/"EOF" or "EPOCH0"/"EPOCH1"
+                hw_sec = int(m.group(5))
+                hw_nsec = int(m.group(6))
                 # Raw HW timestamp in boot-time ms
                 hw_ts_raw = hw_sec * 1000.0 + hw_nsec / 1_000_000.0
                 # Convert to the line-timestamp domain (identity for ftrace,
@@ -274,27 +278,29 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
 
                 # Detect simultaneous SOF+EOF: check if another event for the same
                 # (csid, path) arrived at a very close HW timestamp (within 1us).
-                path_key = (csid_idx, path_name)
-                last_hw = last_hw_ts_per_path.get(path_key)
-                simultaneous = False
-                if last_hw is not None and abs(hw_ts_ms - last_hw) < 0.001:
-                    simultaneous = True
-                last_hw_ts_per_path[path_key] = hw_ts_ms
-
-                # Also check: if we just saw the opposite event type at the exact
-                # same HW timestamp, that's a SOF+EOF collision error.
-                # Mark BOTH events (the earlier one already appended, and this one).
+                # Only applies to SOF/EOF, not EPOCH events.
                 sof_eof_collision = False
-                if simultaneous:
-                    for prev_evt in reversed(events):
-                        if (prev_evt.csid == csid_idx and
-                            path_name in prev_evt.extra and
-                            abs(prev_evt.ts_ms - hw_ts_ms) < 0.001):
-                            if prev_evt.event_type != evt_type:
-                                sof_eof_collision = True
-                                if '!!SOF+EOF COLLISION!!' not in prev_evt.extra:
-                                    prev_evt.extra += ' !!SOF+EOF COLLISION!!'
-                            break
+                if evt_type in ('SOF', 'EOF'):
+                    path_key = (csid_idx, path_name)
+                    last_hw = last_hw_ts_per_path.get(path_key)
+                    simultaneous = False
+                    if last_hw is not None and abs(hw_ts_ms - last_hw) < 0.001:
+                        simultaneous = True
+                    last_hw_ts_per_path[path_key] = hw_ts_ms
+
+                    # Also check: if we just saw the opposite event type at the exact
+                    # same HW timestamp, that's a SOF+EOF collision error.
+                    # Mark BOTH events (the earlier one already appended, and this one).
+                    if simultaneous:
+                        for prev_evt in reversed(events):
+                            if (prev_evt.csid == csid_idx and
+                                path_name in prev_evt.extra and
+                                abs(prev_evt.ts_ms - hw_ts_ms) < 0.001):
+                                if prev_evt.event_type != evt_type:
+                                    sof_eof_collision = True
+                                    if '!!SOF+EOF COLLISION!!' not in prev_evt.extra:
+                                        prev_evt.extra += ' !!SOF+EOF COLLISION!!'
+                                break
 
                 extra = f'CSID:{csid_idx} {path_name}'
                 if sof_eof_collision:
@@ -346,7 +352,8 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
                 if csid_path_filter and path_name != csid_path_filter:
                     continue
 
-                # Status is a bitmask: 0x1000 = SOF, 0x200 = EOF, 0x800000 = RUP_ACK.
+                # Status is a bitmask: 0x1000 = SOF, 0x200 = EOF,
+                # 0x200000 = EPOCH0, 0x400000 = EPOCH1, 0x800000 = RUP_ACK.
                 # A single IRQ may carry multiple bits (e.g. 0x1200 = previous EOF
                 # coalesced with next SOF). Emit EOF before SOF in that case so
                 # the square wave goes high->low->high cleanly.
@@ -355,6 +362,10 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
                     evt_types.append('EOF')
                 if status & 0x1000:
                     evt_types.append('SOF')
+                if status & 0x200000:
+                    evt_types.append('EPOCH0')
+                if status & 0x400000:
+                    evt_types.append('EPOCH1')
                 if not evt_types:
                     # 0x800000 RUP_ACK is handled by irq_handler; ignore everything else
                     continue
@@ -390,7 +401,7 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
                 ctx_id = int(m.group(2))
                 link = m.group(3).lower()
 
-                evt_map = {2: 'RUP', 3: 'EPOCH'}
+                evt_map = {2: 'RUP', 3: 'EPOCH0'}
                 if evt_id not in evt_map:
                     continue
 
@@ -601,7 +612,7 @@ def validate_and_associate_events(events: List[Event]) -> List[Event]:
                 for sof in pending_sofs_for_rup:
                     sof.assoc_rup = evt
                 pending_sofs_for_rup = []
-            elif evt.event_type == 'EPOCH' and pending_sofs_for_rup:
+            elif evt.event_type in ('EPOCH0', 'EPOCH1') and pending_sofs_for_rup:
                 for sof in pending_sofs_for_rup:
                     if sof.assoc_rup is None:
                         sof.assoc_rup = evt
@@ -866,7 +877,7 @@ def generate_timing_diagram(events: List[Event], use_color: bool = True,
         for e in pipe_events:
             if e.event_type == 'SOF':
                 last_sof_ts = e.ts_ms
-            elif e.event_type == 'EPOCH' and last_sof_ts is not None:
+            elif e.event_type in ('EPOCH0', 'EPOCH1') and last_sof_ts is not None:
                 sof_epoch_pairs.append(e.ts_ms - last_sof_ts)
                 last_sof_ts = None
         if sof_epoch_pairs:
@@ -921,7 +932,7 @@ def generate_ascii_waveform(events: List[Event], use_color: bool = True,
     output_lines.append("ISP WAVEFORM TIMING DIAGRAM")
     output_lines.append("=" * max_width)
     output_lines.append("")
-    output_lines.append("Legend:  ▼=SOF  ▲=EOF  ■=RUP  ●=EPOCH  ★=BUF_DONE")
+    output_lines.append("Legend:  ▼=SOF  ▲=EOF  ■=RUP  ●=EPOCH0  ○=EPOCH1  ★=BUF_DONE")
     output_lines.append(f"        |...| = one frame boundary (SOF to next SOF)")
     output_lines.append("")
 
@@ -940,7 +951,7 @@ def generate_ascii_waveform(events: List[Event], use_color: bool = True,
         tw = max_width - 15  # label space
 
         # Create per-type lanes
-        lane_types = ['SOF', 'RUP', 'EPOCH', 'BUF_DONE', 'EOF']
+        lane_types = ['SOF', 'RUP', 'EPOCH0', 'EPOCH1', 'BUF_DONE', 'EOF']
         lanes: Dict[str, List[str]] = {}
         for lt in lane_types:
             lanes[lt] = ['─'] * tw
@@ -1010,7 +1021,8 @@ def _evt_tooltip(evt: Event) -> str:
 
 
 def generate_html_timing(events: List[Event], max_width: int = 150,
-                         ctx_ipp_paths: Optional[Dict[int, set]] = None) -> str:
+                         ctx_ipp_paths: Optional[Dict[int, set]] = None,
+                         filename: str = '') -> str:
     """Generate an interactive HTML timing diagram with zoom/pan and crosshair cursor."""
     if not events:
         return "<p>No events found.</p>"
@@ -1085,7 +1097,8 @@ def generate_html_timing(events: List[Event], max_width: int = 150,
 <style>
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{ background: #1a1a2e; color: #d4d4d4; font-family: "Consolas","Monaco",monospace; font-size: 13px; padding: 15px; }}
-h2 {{ color: #e0e0e0; margin: 10px 0; }}
+h2 {{ color: #e0e0e0; margin: 10px 0; display: flex; justify-content: space-between; align-items: center; }}
+.filename {{ color: #888; font-size: 12px; font-weight: normal; }}
 h3 {{ color: #ccc; margin: 8px 0 4px 0; font-size: 14px; }}
 .pipeline {{ margin: 15px 0; padding: 12px; border: 1px solid #333; border-radius: 4px; background: #16213e; }}
 .legend {{ display: flex; gap: 20px; margin: 8px 0; flex-wrap: wrap; font-size: 12px; }}
@@ -1121,14 +1134,23 @@ th {{ color: #667; background: #16213e; position: sticky; top: 0; }}
 .measure-item .m-desc {{ color: #888; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
 .measure-item .m-remove {{ color: #666; cursor: pointer; padding: 0 4px; font-size: 14px; line-height: 1; }}
 .measure-item .m-remove:hover {{ color: #e06c75; }}
+.lane-toggles {{ display: flex; align-items: center; gap: 4px; margin: 6px 0; flex-wrap: wrap; font-size: 11px; }}
+.lane-toggles .toggle-label {{ color: #667; margin-right: 2px; }}
+.lane-toggles .toggle-sep {{ color: #444; margin: 0 6px; }}
+.toggle-cb {{ display: inline-flex; align-items: center; gap: 3px; cursor: pointer; padding: 1px 5px; border-radius: 3px; background: #1a1a3a; border: 1px solid #333; }}
+.toggle-cb:hover {{ border-color: #555; }}
+.toggle-cb input {{ margin: 0; cursor: pointer; }}
+.toggle-cb span {{ font-size: 11px; }}
 </style>
 </head><body>
-<h2>ISP Timing Diagram</h2>
+<h2><span>ISP Timing Diagram</span><span class="filename">{filename}</span></h2>
 <div class="legend">
   <div class="legend-item"><svg width="30" height="14"><path d="M0,12 L0,2 L30,2" stroke="#4ec9b0" fill="none" stroke-width="2"/></svg><span>SOF↑/EOF↓ (IPP_0)</span></div>
   <div class="legend-item"><svg width="30" height="14"><path d="M0,12 L0,2 L30,2" stroke="#9cdcfe" fill="none" stroke-width="2"/></svg><span>SOF↑/EOF↓ (IPP_1, 2EXP)</span></div>
+  <div class="legend-item"><svg width="30" height="14"><path d="M0,12 L0,2 L30,2" stroke="#b8a0d4" fill="none" stroke-width="2"/></svg><span>SOF↑/EOF↓ (IPP_2, 3EXP)</span></div>
   <div class="legend-item"><span style="color:#569cd6;font-size:16px">▮</span><span>RUP</span></div>
-  <div class="legend-item"><span style="color:#dcdcaa;font-size:16px">◆</span><span>EPOCH</span></div>
+  <div class="legend-item"><span style="color:#dcdcaa;font-size:16px">◆</span><span>EPOCH0</span></div>
+  <div class="legend-item"><span style="color:#d4be98;font-size:16px">◇</span><span>EPOCH1</span></div>
   <div class="legend-item"><span style="color:#c586c0;font-size:16px">★</span><span>BUF_DONE</span></div>
   <div class="legend-item"><svg width="14" height="14"><polygon points="7,2 3,8 11,8" fill="none" stroke="#ff4500" stroke-width="1.2" stroke-dasharray="2,1.5"/></svg><span>SOF w/o prior EOF</span></div>
   <div class="legend-item"><svg width="14" height="14"><polygon points="7,12 3,6 11,6" fill="none" stroke="#ff4500" stroke-width="1.2" stroke-dasharray="2,1.5"/></svg><span>EOF w/o prior SOF</span></div>
@@ -1160,7 +1182,7 @@ const STATS = {json.dumps(stats_data)};
 
 const COLORS = {{
   SOF: '#4ec9b0', EOF: '#4ec9b0', FRAME: '#4ec9b0', FRAME2: '#9cdcfe',
-  RUP: '#569cd6', EPOCH: '#dcdcaa', BUF_DONE: '#c586c0',
+  RUP: '#569cd6', EPOCH0: '#dcdcaa', EPOCH1: '#d4be98', BUF_DONE: '#c586c0',
 }};
 
 const LANE_H = 50, LANE_GAP = 8, MARGIN_L = 90, MARGIN_R = 20, MARGIN_T = 10;
@@ -1181,7 +1203,9 @@ class TimingView {{
     this.view_start = this.t_min;
     this.view_end = this.t_max;
 
-    this.lanes = ['FRAME', 'RUP', 'EPOCH', 'BUF_DONE'];
+    this.lanes = ['FRAME', 'RUP', 'EPOCH0', 'EPOCH1', 'BUF_DONE'];
+    this.visibleLanes = new Set(this.lanes);
+    this.visiblePaths = new Set(pipeData.ipp_paths);
     this.svgWidth = container.clientWidth || 1200;
     this.svgHeight = this.lanes.length * (LANE_H + LANE_GAP) + 50;
     this.plotWidth = this.svgWidth - MARGIN_L - MARGIN_R;
@@ -1316,6 +1340,16 @@ class TimingView {{
     return null;
   }}
 
+  _isEvtVisible(evt) {{
+    const lane = (evt.type === 'SOF' || evt.type === 'EOF') ? 'FRAME' : evt.type;
+    if (!this.visibleLanes.has(lane)) return false;
+    if ((evt.type === 'SOF' || evt.type === 'EOF') && evt.extra) {{
+      const pathMatch = evt.extra.match(/IPP_\d+/);
+      if (pathMatch && !this.visiblePaths.has(pathMatch[0])) return false;
+    }}
+    return true;
+  }}
+
   _getEvtY(evt) {{
     // Get the Y position where a given event's marker is drawn
     const laneIdx = this.lanes.indexOf(evt.type === 'SOF' || evt.type === 'EOF' ? 'FRAME' : evt.type);
@@ -1352,6 +1386,7 @@ class TimingView {{
     let nearest = null, minDist = Infinity;
     for (const evt of this.events) {{
       if (evt.ts < this.view_start || evt.ts > this.view_end) continue;
+      if (!this._isEvtVisible(evt)) continue;
       // Map event type to lane
       const evtLane = (evt.type === 'SOF' || evt.type === 'EOF') ? 'FRAME' : evt.type;
       if (hoveredLane && evtLane !== hoveredLane) continue;
@@ -1405,6 +1440,7 @@ class TimingView {{
     let nearest = null, minDist = Infinity;
     for (const evt of this.events) {{
       if (evt.ts < this.view_start || evt.ts > this.view_end) continue;
+      if (!this._isEvtVisible(evt)) continue;
       const evtLane = (evt.type === 'SOF' || evt.type === 'EOF') ? 'FRAME' : evt.type;
       if (hoveredLane && evtLane !== hoveredLane) continue;
       const ex = this.tsToX(evt.ts);
@@ -1651,6 +1687,7 @@ class TimingView {{
     // Draw lanes
     for (let li = 0; li < this.lanes.length; li++) {{
       const laneName = this.lanes[li];
+      if (!this.visibleLanes.has(laneName)) continue;
       const ly = li * (LANE_H + LANE_GAP) + MARGIN_T;
       const highY = ly + 8, lowY = ly + 40, midY = ly + 24;
 
@@ -1680,20 +1717,26 @@ class TimingView {{
   }}
 
   _drawFrameLane(ly, highY, lowY, vs, ve) {{
-    const is2exp = this.data.is_2exp;
-    const paths = this.data.ipp_paths;
+    const isMultiExp = this.data.is_2exp;
+    const paths = this.data.ipp_paths.filter(p => this.visiblePaths.has(p));
 
-    if (is2exp) {{
-      const subH = (lowY - highY - 4) / 2;
-      const colors = ['#4ec9b0', '#9cdcfe'];
+    if (paths.length === 0) return;
+
+    if (isMultiExp && paths.length > 1) {{
+      const numPaths = paths.length;
+      const subH = (lowY - highY - 4 * (numPaths - 1)) / numPaths;
+      const colors = {{'IPP_0': '#4ec9b0', 'IPP_1': '#9cdcfe', 'IPP_2': '#b8a0d4'}};
       paths.forEach((path, idx) => {{
         const sH = highY + idx * (subH + 4);
         const sL = sH + subH;
-        this._text(MARGIN_L - 5, sH + subH/2 + 3, path, colors[idx], 9).setAttribute('text-anchor', 'end');
-        this._drawSquareWave(path, sH, sL, colors[idx], vs, ve);
+        const color = colors[path] || '#4ec9b0';
+        this._text(MARGIN_L - 5, sH + subH/2 + 3, path, color, 9).setAttribute('text-anchor', 'end');
+        this._drawSquareWave(path, sH, sL, color, vs, ve);
       }});
     }} else {{
-      this._drawSquareWave('IPP_0', highY, lowY, '#4ec9b0', vs, ve);
+      const singlePath = paths[0];
+      const colors = {{'IPP_0': '#4ec9b0', 'IPP_1': '#9cdcfe', 'IPP_2': '#b8a0d4'}};
+      this._drawSquareWave(singlePath, highY, lowY, colors[singlePath] || '#4ec9b0', vs, ve);
     }}
   }}
 
@@ -1854,10 +1897,16 @@ class TimingView {{
         r.setAttribute('width', 3); r.setAttribute('height', 20);
         r.setAttribute('fill', color); r.setAttribute('opacity', 0.85);
         this.svg.appendChild(r);
-      }} else if (laneName === 'EPOCH') {{
+      }} else if (laneName === 'EPOCH0') {{
         const p = this._ns('polygon');
         p.setAttribute('points', `${{x}},${{midY-8}} ${{x+5}},${{midY}} ${{x}},${{midY+8}} ${{x-5}},${{midY}}`);
         p.setAttribute('fill', color); p.setAttribute('opacity', 0.85);
+        this.svg.appendChild(p);
+      }} else if (laneName === 'EPOCH1') {{
+        const p = this._ns('polygon');
+        p.setAttribute('points', `${{x}},${{midY-8}} ${{x+5}},${{midY}} ${{x}},${{midY+8}} ${{x-5}},${{midY}}`);
+        p.setAttribute('fill', 'none'); p.setAttribute('stroke', color);
+        p.setAttribute('stroke-width', 1.5); p.setAttribute('opacity', 0.85);
         this.svg.appendChild(p);
       }} else if (laneName === 'BUF_DONE') {{
         const pts = [];
@@ -1963,17 +2012,55 @@ Object.entries(PIPELINES).forEach(([key, data]) => {{
   div.dataset.pipeKey = key;
 
   let modeStr = stats.is_2exp ? `<b>${{stats.ipp_paths.length}}EXP (sHDR)</b> paths: ${{stats.ipp_paths.join(', ')}}` : '<b>1EXP</b>';
+
+  // Build lane/path toggle checkboxes
+  const allLanes = ['FRAME', 'RUP', 'EPOCH0', 'EPOCH1', 'BUF_DONE'];
+  const laneColors = {{'FRAME':'#4ec9b0','RUP':'#569cd6','EPOCH0':'#dcdcaa','EPOCH1':'#d4be98','BUF_DONE':'#c586c0'}};
+  const pathColors = {{'IPP_0':'#4ec9b0','IPP_1':'#9cdcfe','IPP_2':'#b8a0d4'}};
+  let togglesHtml = '<div class="lane-toggles">';
+  togglesHtml += '<span class="toggle-label">Lanes:</span>';
+  allLanes.forEach(l => {{
+    togglesHtml += `<label class="toggle-cb"><input type="checkbox" checked data-lane="${{l}}"><span style="color:${{laneColors[l]}}">${{l}}</span></label>`;
+  }});
+  if (data.ipp_paths.length > 1) {{
+    togglesHtml += '<span class="toggle-sep">|</span><span class="toggle-label">Paths:</span>';
+    data.ipp_paths.forEach(p => {{
+      togglesHtml += `<label class="toggle-cb"><input type="checkbox" checked data-path="${{p}}"><span style="color:${{pathColors[p] || '#aaa'}}">${{p}}</span></label>`;
+    }});
+  }}
+  togglesHtml += '</div>';
+
   div.innerHTML = `<h3>Pipeline: ${{key}}</h3>
     <div class="stats">${{modeStr}} | SOF-SOF: ${{stats.avg_period_ms}}ms (~${{stats.fps}} fps) | Events: ${{stats.num_events}}</div>
+    ${{togglesHtml}}
     <div class="svg-container"></div>`;
   pipelinesDiv.appendChild(div);
 
   const container = div.querySelector('.svg-container');
   container.style.width = '100%';
-  container.style.height = (4 * (LANE_H + LANE_GAP) + 50) + 'px';
+  container.style.height = (5 * (LANE_H + LANE_GAP) + 50) + 'px';
 
   const view = new TimingView(container, key, data);
   allViews.push(view);
+
+  // Bind lane toggles
+  div.querySelectorAll('input[data-lane]').forEach(cb => {{
+    cb.addEventListener('change', () => {{
+      const lane = cb.dataset.lane;
+      if (cb.checked) view.visibleLanes.add(lane);
+      else view.visibleLanes.delete(lane);
+      view.render();
+    }});
+  }});
+  // Bind path toggles
+  div.querySelectorAll('input[data-path]').forEach(cb => {{
+    cb.addEventListener('change', () => {{
+      const path = cb.dataset.path;
+      if (cb.checked) view.visiblePaths.add(path);
+      else view.visiblePaths.delete(path);
+      view.render();
+    }});
+  }});
 }});
 
 // --- Sync Zoom ---
@@ -2057,7 +2144,7 @@ document.getElementById('btn-merge-view').addEventListener('click', function() {
 
   // Group by lane type, then by pipeline within each lane
   const pipeKeys = Object.keys(PIPELINES);
-  const laneTypes = ['FRAME', 'RUP', 'EPOCH', 'BUF_DONE'];
+  const laneTypes = ['FRAME', 'RUP', 'EPOCH0', 'EPOCH1', 'BUF_DONE'];
   const numSubLanes = pipeKeys.length;
   const subLaneH = Math.max(30, Math.floor(50 / numSubLanes));
   const mergedLaneH = subLaneH * numSubLanes + 10;
@@ -2216,10 +2303,16 @@ document.getElementById('btn-merge-view').addEventListener('click', function() {
                 r.setAttribute('width', 2); r.setAttribute('height', 14);
                 r.setAttribute('fill', color); r.setAttribute('opacity', 0.85);
                 this.svg.appendChild(r);
-              }} else if (laneName === 'EPOCH') {{
+              }} else if (laneName === 'EPOCH0') {{
                 const p = this._ns('polygon');
                 p.setAttribute('points', `${{x}},${{sMid-6}} ${{x+4}},${{sMid}} ${{x}},${{sMid+6}} ${{x-4}},${{sMid}}`);
                 p.setAttribute('fill', color); p.setAttribute('opacity', 0.85);
+                this.svg.appendChild(p);
+              }} else if (laneName === 'EPOCH1') {{
+                const p = this._ns('polygon');
+                p.setAttribute('points', `${{x}},${{sMid-6}} ${{x+4}},${{sMid}} ${{x}},${{sMid+6}} ${{x-4}},${{sMid}}`);
+                p.setAttribute('fill', 'none'); p.setAttribute('stroke', color);
+                p.setAttribute('stroke-width', 1.2); p.setAttribute('opacity', 0.85);
                 this.svg.appendChild(p);
               }} else if (laneName === 'BUF_DONE') {{
                 const pts = [];
@@ -2393,8 +2486,10 @@ def main():
 
     output = ""
     if args.mode == 'html':
+        import os
         output = generate_html_timing(events, max_width=args.width,
-                                      ctx_ipp_paths=ctx_ipp_paths)
+                                      ctx_ipp_paths=ctx_ipp_paths,
+                                      filename=os.path.basename(args.logfile))
         # Default output to .html file
         if not args.output:
             args.output = args.logfile.rsplit('.', 1)[0] + '_timing.html'
