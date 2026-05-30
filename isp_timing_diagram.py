@@ -178,7 +178,7 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
     is_ftrace = False
     hw_to_line_offset: float = 0.0
     offset_samples: List[float] = []
-    with open(filepath, 'r', errors='replace') as f_pre:
+    with open(filepath, 'r', encoding='utf-8', errors='replace') as f_pre:
         for pre_line in f_pre:
             if not is_ftrace and ts_re_ftrace.search(pre_line):
                 is_ftrace = True
@@ -202,7 +202,7 @@ def parse_log(filepath: str, ctx_filter: Optional[int] = None,
     # Pattern to learn ctx-link mapping
     ctx_link_re = re.compile(r'ctx[_:]?\s*(\d+).*?link[:\s]+\s*(0x[0-9a-fA-F]+)')
 
-    with open(filepath, 'r', errors='replace') as f:
+    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
         for line_no, line in enumerate(f, 1):
             # Skip non-camera lines for performance
             if ('CAM' not in line and 'cam_ife' not in line
@@ -2428,6 +2428,9 @@ document.getElementById('btn-merge-view').addEventListener('click', function() {
 
 
 def main():
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
     parser = argparse.ArgumentParser(
         description='ISP Timing Diagram Generator - Parse camera kernel logs '
                     'and generate timing diagrams for ISP HW events.')
